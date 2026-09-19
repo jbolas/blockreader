@@ -1,0 +1,13 @@
+[package]
+name = "blockreader"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal, zero-dependency, read-only random-access byte source for forensic disk images."
+authors = ["Jeffrey Bolas"]
+license = "MIT"
+repository = "https://github.com/jbolas/blockreader"
+readme = "README.md"
+
+# Deliberately empty. This crate is the seam between forensic container
+# formats and filesystem parsers.
+[dependencies]
