@@ -1,0 +1,11 @@
+# cargo-deny configuration.
+#
+#   cargo deny check licenses
+#
+# blockreader has no dependencies, so the only license in its tree is its own.
+# The list exists so that adding a dependency with an unexpected license fails
+# this check rather than passing silently. Add a license here when a
+# dependency brings it, not in anticipation.
+
+[licenses]
+allow = ["MIT"]

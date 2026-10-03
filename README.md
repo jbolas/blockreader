@@ -18,7 +18,7 @@ use blockreader::{BlockReader, FileSource, read_exact_at};
 fn is_gpt(source: &dyn BlockReader) -> bool {
     // The GPT header lives at LBA 1, so its byte offset depends on
     // the sector size the source reports.
-    let at = u64::from(source.sector_size());
+    let at = u64::from(source.sector_size().bytes());
     let mut signature = [0u8; 8];
     match read_exact_at(source, at, &mut signature) {
         Ok(()) => &signature == b"EFI PART",

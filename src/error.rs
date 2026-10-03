@@ -10,19 +10,6 @@ pub enum Error {
     /// The host filesystem failed.
     Io(std::io::Error),
 
-    /// A read was requested entirely outside the source's addressable range.
-    ///
-    /// Note that a read *starting* inside the source and running past its end
-    /// is not an error: it is a short read. This variant is for a request
-    /// that could never be satisfied, which usually means a caller computed
-    /// an offset wrongly.
-    OutOfBounds {
-        /// The offset requested.
-        offset: u64,
-        /// The source's size.
-        size: u64,
-    },
-
     /// The source ended before [`crate::read_exact_at`] could fill its buffer.
     UnexpectedEof {
         /// Where the read began.
@@ -42,12 +29,53 @@ pub enum Error {
         bytes: u32,
     },
 
+    /// The content of a range is unknown, so no bytes can be returned for it.
+    ///
+    /// `offset` and `len` describe the whole unknown range containing the
+    /// requested offset, as far as the backend knows it. A caller that wants
+    /// to continue resumes reading at `offset + len`. See the rules on
+    /// [`crate::BlockReader`].
+    UnknownContent {
+        /// Where the unknown range begins.
+        offset: u64,
+        /// How long it is.
+        len: u64,
+        /// Why its content is unknown.
+        cause: UnknownCause,
+    },
+
     /// A backend-specific failure.
     ///
     /// This is how a container format reports its own errors without this
     /// crate depending on it. An AFF4 backend puts an `aff4tools::Error`
     /// here; an E01 backend puts its own.
     Backend(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Why the content of a range is unknown.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnknownCause {
+    /// The acquisition never read this range, as with AFF4 `aff4:UnknownData`.
+    NotAcquired,
+    /// The source medium returned read errors when it was acquired, as with
+    /// AFF4 `aff4:UnreadableData`.
+    UnreadableAtAcquisition,
+    /// The container's stored bytes fail an integrity check, as with an E01
+    /// chunk that will not decompress or fails its checksum.
+    FailedIntegrity,
+}
+
+impl fmt::Display for UnknownCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotAcquired => "the acquisition did not read this range",
+            Self::UnreadableAtAcquisition => {
+                "the source medium could not be read here when it was acquired"
+            }
+            Self::FailedIntegrity => "the container's stored data fails an integrity check",
+        })
+    }
 }
 
 impl Error {
@@ -64,10 +92,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "read failed: {e}"),
-            Self::OutOfBounds { offset, size } => write!(
-                f,
-                "offset {offset} is outside the source (size {size} bytes)"
-            ),
             Self::UnexpectedEof {
                 offset,
                 wanted,
@@ -80,6 +104,11 @@ impl fmt::Display for Error {
                 f,
                 "{bytes} is not a valid sector size; it must be a non-zero power of two"
             ),
+            Self::UnknownContent { offset, len, cause } => write!(
+                f,
+                "content of bytes {offset}..{} is unknown: {cause}",
+                offset.saturating_add(*len)
+            ),
             Self::Backend(e) => write!(f, "{e}"),
         }
     }
@@ -90,9 +119,9 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
             Self::Backend(e) => Some(e.as_ref()),
-            Self::OutOfBounds { .. }
-            | Self::UnexpectedEof { .. }
-            | Self::InvalidSectorSize { .. } => None,
+            Self::UnexpectedEof { .. }
+            | Self::InvalidSectorSize { .. }
+            | Self::UnknownContent { .. } => None,
         }
     }
 }
@@ -142,12 +171,27 @@ mod tests {
             "{s}"
         );
 
-        let e = Error::OutOfBounds {
-            offset: 900,
-            size: 512,
+        let e = Error::UnknownContent {
+            offset: 32_768,
+            len: 32_768,
+            cause: UnknownCause::FailedIntegrity,
         };
         let s = e.to_string();
-        assert!(s.contains("900") && s.contains("512"), "{s}");
+        assert!(
+            s.contains("32768") && s.contains("65536") && s.contains("integrity"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn every_cause_explains_itself() {
+        for cause in [
+            UnknownCause::NotAcquired,
+            UnknownCause::UnreadableAtAcquisition,
+            UnknownCause::FailedIntegrity,
+        ] {
+            assert!(!cause.to_string().is_empty());
+        }
     }
 
     #[test]

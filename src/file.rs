@@ -1,11 +1,12 @@
 //! A [`BlockReader`] over a plain file: raw dd images and split-free captures.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-use crate::{BlockReader, DEFAULT_SECTOR_SIZE, Error, Result, SourceDescription};
+use crate::{BlockReader, Error, Location, Result, SectorSize, SectorSizeBasis, SourceDescription};
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("FileSource needs positioned reads, which std provides only on Unix and Windows");
 
 /// A byte source backed by a plain file.
 ///
@@ -17,18 +18,18 @@ use crate::{BlockReader, DEFAULT_SECTOR_SIZE, Error, Result, SourceDescription};
 /// # Sector size
 ///
 /// A plain file carries no record of the sector size of the device it came
-/// from, so the default is [`DEFAULT_SECTOR_SIZE`] and
-/// [`SourceDescription::sector_size_assumed`] is set. A caller that knows
-/// better sets it with [`with_sector_size`](Self::with_sector_size).
+/// from, so the default is [`SectorSize::DEFAULT`]: 512 bytes, assumed. A
+/// caller that knows better sets it with
+/// [`with_sector_size`](Self::with_sector_size), which records it as
+/// asserted.
 #[derive(Debug)]
 pub struct FileSource {
-    /// Seek and read must happen together, so the handle is guarded rather
-    /// than the two calls being separately atomic.
-    file: Mutex<File>,
+    /// Read with positioned reads, which never move a shared cursor, so one
+    /// handle serves concurrent readers without a lock.
+    file: File,
     path: PathBuf,
     size: u64,
-    sector_size: u32,
-    sector_size_assumed: bool,
+    sector_size: SectorSize,
 }
 
 impl FileSource {
@@ -38,21 +39,37 @@ impl FileSource {
     ///
     /// Returns [`Error::Io`] if the file cannot be opened or its length
     /// cannot be determined.
+    ///
+    /// Returns [`Error::Io`] of kind `InvalidInput` if `path` is not a
+    /// regular file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
-        let size = file.metadata()?.len();
+        let meta = file.metadata()?;
+        // A device node's metadata reports a length of 0, so without this
+        // check a block device would read as an empty image. Finding a
+        // device's real size needs an ioctl on macOS, which this crate's
+        // no-unsafe, no-dependency rules exclude, so devices are refused.
+        if !meta.is_file() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a regular file; FileSource reads only regular files, \
+                     not directories or devices",
+                    path.display()
+                ),
+            )));
+        }
         Ok(Self {
-            file: Mutex::new(file),
+            file,
             path,
-            size,
-            sector_size: DEFAULT_SECTOR_SIZE,
-            sector_size_assumed: true,
+            size: meta.len(),
+            sector_size: SectorSize::DEFAULT,
         })
     }
 
-    /// Declare the real sector size, overriding the assumed default.
-    /// Clears [`SourceDescription::sector_size_assumed`].
+    /// Declare the real sector size. It is reported as
+    /// [`SectorSizeBasis::Asserted`].
     ///
     /// # Errors
     ///
@@ -60,11 +77,7 @@ impl FileSource {
     /// of two. Partition-table addressing multiplies by this value, so a
     /// nonsensical one would silently produce nonsensical offsets.
     pub fn with_sector_size(mut self, bytes: u32) -> Result<Self> {
-        if bytes == 0 || !bytes.is_power_of_two() {
-            return Err(Error::InvalidSectorSize { bytes });
-        }
-        self.sector_size = bytes;
-        self.sector_size_assumed = false;
+        self.sector_size = SectorSize::new(bytes, SectorSizeBasis::Asserted)?;
         Ok(self)
     }
 
@@ -76,25 +89,19 @@ impl FileSource {
 
     /// A second handle on the same file, with its own descriptor.
     ///
-    /// Sharing one `FileSource` across threads is safe but serializes reads
-    /// on its lock. Where genuine parallel throughput is wanted, give each
-    /// worker its own handle from here.
+    /// Reads need no lock, so sharing one `FileSource` across threads is
+    /// already concurrent. A separate handle is still useful where a caller
+    /// wants independent ownership.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] if the descriptor cannot be duplicated.
     pub fn try_clone(&self) -> Result<Self> {
-        let file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_clone()?;
         Ok(Self {
-            file: Mutex::new(file),
+            file: self.file.try_clone()?,
             path: self.path.clone(),
             size: self.size,
             sector_size: self.sector_size,
-            sector_size_assumed: self.sector_size_assumed,
         })
     }
 }
@@ -104,34 +111,46 @@ impl BlockReader for FileSource {
         if offset >= self.size || buf.is_empty() {
             return Ok(0);
         }
-        // A poisoned lock means another thread panicked mid-read. The file
-        // itself is unharmed, so recover the guard rather than propagating.
-        let mut file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.seek(SeekFrom::Start(offset))?;
-        // A single `read` may return short for reasons that are not errors.
-        // Callers wanting a full buffer use `read_exact_at`.
-        let n = file.read(buf)?;
-        Ok(n)
+        // A single positioned read may return short for reasons that are
+        // not errors. Callers wanting a full buffer use `read_exact_at`.
+        loop {
+            match positioned_read(&self.file, buf, offset) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                other => return Ok(other?),
+            }
+        }
     }
 
     fn size(&self) -> u64 {
         self.size
     }
 
-    fn sector_size(&self) -> u32 {
+    fn sector_size(&self) -> SectorSize {
         self.sector_size
     }
 
     fn describe(&self) -> SourceDescription {
-        SourceDescription {
-            path: Some(self.path.clone()),
-            format: Some("raw".to_string()),
-            sector_size_assumed: self.sector_size_assumed,
-        }
+        SourceDescription::new(
+            Some(Location::Path(self.path.clone())),
+            Some("raw".to_string()),
+        )
     }
+}
+
+/// Read into `buf` at `offset` without moving any shared file cursor.
+#[cfg(unix)]
+fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+/// Read into `buf` at `offset`. On Windows, `seek_read` moves the handle's
+/// cursor, but every read names its offset, so concurrent reads are still
+/// correct.
+#[cfg(windows)]
+fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
 }
 
 #[cfg(test)]
@@ -204,8 +223,7 @@ mod tests {
     fn sector_size_defaults_to_512_and_says_it_assumed() {
         let path = temp_image("sector-default", 512);
         let s = FileSource::open(&path).unwrap();
-        assert_eq!(s.sector_size(), DEFAULT_SECTOR_SIZE);
-        assert!(s.describe().sector_size_assumed);
+        assert_eq!(s.sector_size(), SectorSize::DEFAULT);
         std::fs::remove_file(&path).ok();
     }
 
@@ -216,10 +234,11 @@ mod tests {
             .unwrap()
             .with_sector_size(4096)
             .unwrap();
-        assert_eq!(s.sector_size(), 4096);
-        assert!(
-            !s.describe().sector_size_assumed,
-            "an asserted value is not an assumed one"
+        assert_eq!(s.sector_size().bytes(), 4096);
+        assert_eq!(
+            s.sector_size().basis(),
+            SectorSizeBasis::Asserted,
+            "a declared value is asserted, not assumed"
         );
         std::fs::remove_file(&path).ok();
     }
@@ -238,11 +257,11 @@ mod tests {
     }
 
     #[test]
-    fn describe_reports_path_and_format() {
+    fn describe_reports_location_and_format() {
         let path = temp_image("describe", 64);
         let s = FileSource::open(&path).unwrap();
         let d = s.describe();
-        assert_eq!(d.path.as_deref(), Some(path.as_path()));
+        assert_eq!(d.location, Some(Location::Path(path.clone())));
         assert_eq!(d.format.as_deref(), Some("raw"));
         std::fs::remove_file(&path).ok();
     }
@@ -275,10 +294,64 @@ mod tests {
 
         assert_eq!(
             b.sector_size(),
-            4096,
+            SectorSize::new(4096, SectorSizeBasis::Asserted).unwrap(),
             "clone keeps the asserted sector size"
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // Unix only: on Windows, `File::open` on a directory already fails, with
+    // a different error kind, before the regular-file check is reached.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_is_refused() {
+        let dir = std::env::temp_dir();
+        let err = FileSource::open(&dir).unwrap_err();
+        match err {
+            Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(e.to_string().contains("not a regular file"), "{e}");
+            }
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_node_is_refused_rather_than_read_as_empty() {
+        // /dev/null is a character device on every Unix. Its metadata reports
+        // a length of 0, which is exactly how a block device reads as empty.
+        let err = FileSource::open("/dev/null").unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn one_source_serves_concurrent_readers() {
+        use std::sync::Arc;
+        let path = temp_image("concurrent", 64 * 1024);
+        let s = Arc::new(FileSource::open(&path).unwrap());
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    let offset = i * 8000;
+                    let mut buf = [0u8; 16];
+                    read_exact_at(s.as_ref(), offset, &mut buf).unwrap();
+                    (offset, buf)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (offset, buf) = h.join().unwrap();
+            let expected: Vec<u8> = (offset..offset + 16)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect();
+            assert_eq!(buf.as_slice(), expected.as_slice(), "read at {offset}");
+        }
         std::fs::remove_file(&path).ok();
     }
 
